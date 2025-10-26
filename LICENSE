@@ -19,3 +19,47 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+
+## 謝辞（Acknowledgments）
+
+このプロジェクトは、以下のオープンソースプロジェクトからインスピレーションと
+技術的知見を得て開発されました。
+
+### WinMerge プロジェクトへの謝辞
+
+**WinMerge** - オープンソースの差分・マージツール
+- 公式サイト: https://github.com/WinMerge/winmerge
+- ライセンス: GNU General Public License v2 (GPL v2)
+- 開発者: Thingamahoochie Software, et al.
+
+#### 参考にした技術
+
+1. **LCS（最長共通部分列）アルゴリズムの設計思想**
+   - 動的計画法による最長共通部分列の効率的な計算
+   - O(len1 × len2) の時間計算量での実装
+
+2. **差分検出ロジックのアプローチ**
+   - Eugene Myers アルゴリズムの概念
+   - LCS に基づく文字単位での差分抽出
+   - スコア計算による類似度定量化
+
+3. **文字単位の精密差分表示のコンセプト**
+   - ユーザーが直感的に変更内容を理解できるUI設計
+   - 赤文字によるハイライト表示の実装手法
+
+### ライセンス互換性に関する注記
+
+本プロジェクト（MIT License）は WinMerge（GPL v2）からインスピレーションを
+得ていますが、以下の点を明確にします：
+
+- ✅ WinMerge の C++ ソースコードを直接流用していません
+- ✅ VBA による Excel マクロとしての完全に独立した新規開発です
+- ✅ アルゴリズムの設計原理を参考としています
+- ✅ MIT License と GPL v2 は両立可能です
+
+本プロジェクトの実装は、WinMerge の哲学に触発されながらも、
+Excel 環境に最適化されたアルゴリズムを新たに実装しています。
+
+================================================================================
