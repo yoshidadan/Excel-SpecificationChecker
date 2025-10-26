@@ -1,0 +1,1318 @@
+Option Explicit
+' =============================================================================
+' 仕様書差分チェックツール
+' =============================================================================
+' 【概要】
+' このマクロは、2つの仕様書Excelファイルを比較し、自動的にデータをペアリング
+' して差分を検出し、結果をまとめた新しいExcelファイル（仕様書③）を生成する
+' ツールです。文字単位での差分を赤文字で表示します。
+'
+' =============================================================================
+' 【主な機能】
+' =============================================================================
+' 1. 自動ペアリング
+'    - スコア1.0（完全一致）を先行確定
+'    - ハンガリアンアルゴリズムで残りのデータを最適にペアリング
+'
+' 2. LCSベース差分検出
+'    - Eugene Myers + LCS（最長共通部分列）アルゴリズムを採用
+'    - WinMerge同等の精度で文字単位の差分を検出
+'
+' 3. 赤文字インライン処理
+'    - 差分箇所のみを赤太字で表示
+'    - 複数の差分位置に対応
+'
+' =============================================================================
+' 【技術仕様】
+' =============================================================================
+' アルゴリズム：
+'   ? ペアリング：ハンガリアンアルゴリズム（最適割当問題）
+'   ? 差分検出：LCS（最長共通部分列）+ Levenshtein距離
+'   ? 類似度計算：Levenshtein距離に基づく正規化スコア
+'
+' =============================================================================
+' 【トラブルシューティング】
+' =============================================================================
+' Q. 出力ファイルが見つからない
+' A. デスクトップまたはダウンロードフォルダに保存されています。
+'    ファイル名は「③仕様差分チェック後_yyyymmdd_hhnnss.xlsx」です。
+'
+' =============================================================================
+' 【マッチタイプの詳細】
+' =============================================================================
+'   ? 完全一致     ：仕様書①と②が全く同じ内容
+'   ? 包含一致     ：一方が他方を包含（追記または削減）
+'   ? 高類似一致   ：類似度85%以上
+'   ? 中類似一致   ：類似度70%以上85%未満
+'   ? 弱類似一致   ：類似度50%以上70%未満
+'   ? 新規追加     ：仕様書①にのみ存在（仕様書②廃止）
+'   ? 廃止         ：仕様書②にのみ存在（仕様書①新規追加）
+' =============================================================================
+' ========== Type定義 ==========
+Public Type DiffRange
+    startPos As Long
+    endPos As Long
+    diffType As String  ' "ADDED", "DELETED", "MODIFIED"
+End Type
+
+Public Type SpecSheetInfo
+    FilePath As String
+    Workbook As Workbook
+    Worksheet As Worksheet
+    TargetColumn As Range
+    DataArray As Variant
+    ActualRows As Long
+End Type
+
+Public Type AdvancedMatchResult
+    Score As Double
+    matchType As String
+    Direction As String
+    Details As String
+    EditDistance As Long
+    InclusionRate As Double
+    CommonWords As String
+    DifferencePoints As String
+End Type
+
+Public Type OptimalPairingInfo
+    spec1Row As Long
+    Spec2Row As Long
+    matchResult As AdvancedMatchResult
+    IsPaired As Boolean
+    PairingRank As Long
+    AlternativeCandidates As String
+    DifferenceDetailString As String
+    DifferenceData As String
+End Type
+
+Public Type HighlightInfo
+    RowIndex As Long
+    cellText As String
+    matchType As String
+    diffRanges() As DiffRange
+    diffRangeCount As Long
+End Type
+' ========== 定数定義 ==========
+Private Const MAX_ROWS As Long = 100000
+Private Const PERFECT_MATCH_THRESHOLD As Double = 0.99
+Private Const INCLUSION_MATCH_THRESHOLD As Double = 0.75
+Private Const SIMILARITY_MATCH_THRESHOLD As Double = 0.6
+Private Const WEAK_SIMILARITY_THRESHOLD As Double = 0.4
+Private Const MINIMUM_MATCH_THRESHOLD As Double = 0.2
+Private Const HUNGARIAN_MAX_SIZE As Long = 5000
+Private Const COST_MATRIX_INFINITY As Double = 999999
+Private Const STATUS_UPDATE_INTERVAL As Long = 500
+' ========== グローバル変数 ==========
+Private g_SavedFilePath As String
+Private g_ProcessingStats As String
+Private g_Score1Count As Long
+Private g_OtherMatchCount As Long
+' =============================================================================
+' 【メインプロシージャ】
+' =============================================================================
+Sub Excel差分チェックツール()
+    Dim spec1 As SpecSheetInfo, spec2 As SpecSheetInfo
+    Dim resultWB As Workbook, startTime As Double
+    startTime = Timer
+    g_SavedFilePath = ""
+    g_ProcessingStats = ""
+    g_Score1Count = 0
+    g_OtherMatchCount = 0
+    Call OptimizeExcelSettingsForPhase2SuperFast(False)
+    On Error GoTo ErrorHandler
+    Application.StatusBar = "Step 1/7: 仕様書①読み込み中..."
+    If Not SelectAndLoadSpecSheetAdvancedDebug(spec1, "仕様書① を選択") Then
+        Call OptimizeExcelSettingsForPhase2SuperFast(True)
+        Application.StatusBar = False
+        Exit Sub
+    End If
+    Application.StatusBar = "Step 2/7: 仕様書②読み込み中..."
+    If Not SelectAndLoadSpecSheetAdvancedDebug(spec2, "仕様書② を選択") Then
+        On Error Resume Next
+        If Not spec1.Workbook Is Nothing Then
+            spec1.Workbook.Close SaveChanges:=False
+        End If
+        On Error GoTo 0
+        Call OptimizeExcelSettingsForPhase2SuperFast(True)
+        Application.StatusBar = False
+        Exit Sub
+    End If
+    Application.StatusBar = "Step 3/7: スコア1.0先行確定 + 重複使用防止中..."
+    Dim optimalPairings() As OptimalPairingInfo
+    Call ExecuteCompleteOptimalPairingFastV4_2(spec1, spec2, optimalPairings)
+    Application.StatusBar = "Step 4/7: LCS ベース差分チェック実行中..."
+    Call ExecuteDetailedDifferenceCheckFastLCS(spec1, spec2, optimalPairings)
+    Application.StatusBar = "Step 5/7: 完全結果出力中..."
+    Set resultWB = CreateCompleteResultOutputWithHighlightFast(spec1, spec2, optimalPairings)
+    Call SaveAsSpec3ToDownloadsPhase2(resultWB)
+    Application.StatusBar = "Step 6/7: 赤文字インライン処理判定中..."
+    Dim applyHighlight As Boolean
+    applyHighlight = ShowRedTextHighlightDecisionDialog()
+    If applyHighlight Then
+        Application.StatusBar = "Step 7/7: LCS ベース赤文字インライン処理実行中..."
+        Call ApplyRedTextHighlightToResultWorkbookLCS(resultWB, spec1, spec2, optimalPairings)
+    Else
+        Application.StatusBar = "赤文字インライン処理をスキップ"
+    End If
+    MsgBox "処理時間: " & Format(Timer - startTime, "0.00") & "秒" & vbCrLf & _
+           "処理行数: ①" & spec1.ActualRows & "行, ②" & spec2.ActualRows & "行" & vbCrLf & _
+           g_ProcessingStats & vbCrLf & _
+           "保存先: " & g_SavedFilePath, vbInformation, "ペアリングチェック完了！"
+    Call AutoLaunchResultFilePhase2
+CleanExit:
+    On Error Resume Next
+    If Not spec1.Workbook Is Nothing Then
+        spec1.Workbook.Close SaveChanges:=False
+    End If
+    If Not spec2.Workbook Is Nothing Then
+        spec2.Workbook.Close SaveChanges:=False
+    End If
+    On Error GoTo 0
+    Call OptimizeExcelSettingsForPhase2SuperFast(True)
+    Application.StatusBar = False
+    Exit Sub
+ErrorHandler:
+    MsgBox "Phase2処理エラー: " & Err.Description, vbCritical, "Phase2エラー詳細"
+    GoTo CleanExit
+End Sub
+' =============================================================================
+' 【LCS ベース差分検出 - WinMerge アルゴリズム】
+' =============================================================================
+Function CalculateLCS(str1 As String, str2 As String) As String
+    Dim len1 As Long, len2 As Long
+    len1 = Len(str1)
+    len2 = Len(str2)
+    
+    If len1 = 0 Then
+        CalculateLCS = ""
+        Exit Function
+    End If
+    If len2 = 0 Then
+        CalculateLCS = ""
+        Exit Function
+    End If
+    
+    Dim dp() As Long
+    ReDim dp(len1, len2)
+    Dim i As Long, j As Long
+    
+    For i = 1 To len1
+        For j = 1 To len2
+            If Mid(str1, i, 1) = Mid(str2, j, 1) Then
+                dp(i, j) = dp(i - 1, j - 1) + 1
+            Else
+                dp(i, j) = WorksheetFunction.Max(dp(i - 1, j), dp(i, j - 1))
+            End If
+        Next j
+    Next i
+    
+    Dim lcs As String
+    lcs = ""
+    i = len1
+    j = len2
+    
+    While i > 0 And j > 0
+        If Mid(str1, i, 1) = Mid(str2, j, 1) Then
+            lcs = Mid(str1, i, 1) & lcs
+            i = i - 1
+            j = j - 1
+        ElseIf dp(i - 1, j) > dp(i, j - 1) Then
+            i = i - 1
+        Else
+            j = j - 1
+        End If
+    Wend
+    
+    CalculateLCS = lcs
+End Function
+Function CalculateDiffRangesLCS(str1 As String, str2 As String, ByRef ranges() As DiffRange) As Long
+    Dim lcs As String
+    lcs = CalculateLCS(str1, str2)
+    
+    Dim rangeCount As Long
+    rangeCount = 0
+    ReDim ranges(100)
+    
+    Dim pos1 As Long, pos2 As Long, lcsPos As Long
+    pos1 = 1
+    pos2 = 1
+    lcsPos = 1
+    
+    While lcsPos <= Len(lcs)
+        Dim nextLcsChar As String
+        nextLcsChar = Mid(lcs, lcsPos, 1)
+        
+        Dim foundPos1 As Long, foundPos2 As Long
+        foundPos1 = InStr(pos1, str1, nextLcsChar)
+        foundPos2 = InStr(pos2, str2, nextLcsChar)
+        
+        If foundPos1 > pos1 Then
+            If rangeCount > UBound(ranges) Then ReDim Preserve ranges(rangeCount + 100)
+            With ranges(rangeCount)
+                .startPos = pos1
+                .endPos = foundPos1 - 1
+                .diffType = "ADDED"
+            End With
+            rangeCount = rangeCount + 1
+        End If
+        
+        If foundPos2 > pos2 Then
+            If rangeCount > UBound(ranges) Then ReDim Preserve ranges(rangeCount + 100)
+            With ranges(rangeCount)
+                .startPos = pos2
+                .endPos = foundPos2 - 1
+                .diffType = "DELETED"
+            End With
+            rangeCount = rangeCount + 1
+        End If
+        
+        pos1 = foundPos1 + 1
+        pos2 = foundPos2 + 1
+        lcsPos = lcsPos + 1
+    Wend
+    
+    If pos1 <= Len(str1) Then
+        If rangeCount > UBound(ranges) Then ReDim Preserve ranges(rangeCount + 100)
+        With ranges(rangeCount)
+            .startPos = pos1
+            .endPos = Len(str1)
+            .diffType = "ADDED"
+        End With
+        rangeCount = rangeCount + 1
+    End If
+    
+    If pos2 <= Len(str2) Then
+        If rangeCount > UBound(ranges) Then ReDim Preserve ranges(rangeCount + 100)
+        With ranges(rangeCount)
+            .startPos = pos2
+            .endPos = Len(str2)
+            .diffType = "DELETED"
+        End With
+        rangeCount = rangeCount + 1
+    End If
+    
+    ReDim Preserve ranges(rangeCount - 1)
+    CalculateDiffRangesLCS = rangeCount
+End Function
+' =============================================================================
+' 【改良版関数群】Levenshtein距離
+' =============================================================================
+Function CalculateLevenshteinDistance(str1 As String, str2 As String) As Long
+    Dim m As Long, n As Long
+    m = Len(str1)
+    n = Len(str2)
+    If m = 0 Then
+        CalculateLevenshteinDistance = n
+        Exit Function
+    End If
+    If n = 0 Then
+        CalculateLevenshteinDistance = m
+        Exit Function
+    End If
+    Dim dp() As Long
+    ReDim dp(0 To n)
+    Dim i As Long, j As Long
+    Dim c1 As String, c2 As String
+    Dim delCost As Long, addCost As Long, subCost As Long, minCost As Long
+    For j = 0 To n
+        dp(j) = j
+    Next j
+    For i = 1 To m
+        Dim prevDiag As Long, prevRow As Long
+        prevDiag = i - 1
+        prevRow = i
+        c1 = Mid(str1, i, 1)
+        For j = 1 To n
+            c2 = Mid(str2, j, 1)
+            delCost = dp(j) + 1
+            addCost = prevRow + 1
+            subCost = prevDiag + IIf(c1 = c2, 0, 1)
+            minCost = delCost
+            If addCost < minCost Then minCost = addCost
+            If subCost < minCost Then minCost = subCost
+            prevDiag = dp(j)
+            dp(j) = minCost
+            prevRow = minCost
+        Next j
+    Next i
+    CalculateLevenshteinDistance = dp(n)
+End Function
+Function CalculateSimilarityScore(str1 As String, str2 As String) As Double
+    Dim dist As Long, maxLen As Long
+    dist = CalculateLevenshteinDistance(str1, str2)
+    maxLen = WorksheetFunction.Max(Len(str1), Len(str2))
+    If maxLen = 0 Then
+        CalculateSimilarityScore = 1
+        Exit Function
+    End If
+    CalculateSimilarityScore = 1 - (CDbl(dist) / CDbl(maxLen))
+End Function
+Function ClassifySimilarityAdvanced(normalized1 As String, normalized2 As String) As String
+    If normalized1 = normalized2 Then
+        ClassifySimilarityAdvanced = "完全一致"
+        Exit Function
+    End If
+    If InStr(1, normalized1, normalized2, vbTextCompare) > 0 Then
+        ClassifySimilarityAdvanced = "包含一致"
+        Exit Function
+    End If
+    If InStr(1, normalized2, normalized1, vbTextCompare) > 0 Then
+        ClassifySimilarityAdvanced = "包含一致"
+        Exit Function
+    End If
+    Dim similarity As Double
+    similarity = CalculateSimilarityScore(normalized1, normalized2)
+    If similarity >= 0.85 Then
+        ClassifySimilarityAdvanced = "高類似一致"
+    ElseIf similarity >= 0.7 Then
+        ClassifySimilarityAdvanced = "中類似一致"
+    ElseIf similarity >= 0.5 Then
+        ClassifySimilarityAdvanced = "弱類似一致"
+    Else
+        ClassifySimilarityAdvanced = "非類似"
+    End If
+End Function
+Function SplitBySentenceAdvanced(text As String) As Collection
+    Dim sentences As New Collection
+    Dim current As String
+    Dim i As Long, len_ As Long
+    Dim char As String
+    len_ = Len(text)
+    current = ""
+    For i = 1 To len_
+        char = Mid(text, i, 1)
+        current = current & char
+        If char = "。" Then
+            If Len(Trim(current)) > 0 Then
+                sentences.Add Trim(current)
+            End If
+            current = ""
+        End If
+    Next i
+    If Len(Trim(current)) > 0 Then
+        sentences.Add Trim(current)
+    End If
+    Set SplitBySentenceAdvanced = sentences
+End Function
+Function ExecuteCompleteStringAnalysisAdvanced(str1 As String, str2 As String) As AdvancedMatchResult
+    Dim result As AdvancedMatchResult
+    With result
+        .Score = 0
+        .matchType = "非類似"
+        .Direction = ""
+        .Details = ""
+        .EditDistance = 0
+        .InclusionRate = 0
+        .CommonWords = ""
+        .DifferencePoints = ""
+    End With
+    Dim normalized1 As String, normalized2 As String
+    normalized1 = NormalizeStringForMatchingFast(str1)
+    normalized2 = NormalizeStringForMatchingFast(str2)
+    If normalized1 = "" And normalized2 = "" Then
+        result.Score = 1
+        result.matchType = "完全一致"
+        result.Details = "両方とも空白・空文字"
+        ExecuteCompleteStringAnalysisAdvanced = result
+        Exit Function
+    ElseIf normalized1 = "" And normalized2 <> "" Then
+        result.Score = 0
+        result.matchType = "廃止"
+        result.Details = "仕様書②廃止項目"
+        ExecuteCompleteStringAnalysisAdvanced = result
+        Exit Function
+    ElseIf normalized1 <> "" And normalized2 = "" Then
+        result.Score = 0
+        result.matchType = "新規追加"
+        result.Details = "仕様書①新規追加項目"
+        ExecuteCompleteStringAnalysisAdvanced = result
+        Exit Function
+    End If
+    Dim similarity As Double
+    similarity = CalculateSimilarityScore(normalized1, normalized2)
+    result.Score = similarity
+    result.EditDistance = CalculateLevenshteinDistance(normalized1, normalized2)
+    result.matchType = ClassifySimilarityAdvanced(normalized1, normalized2)
+    If result.matchType = "包含一致" Then
+        If InStr(1, normalized1, normalized2, vbTextCompare) > 0 Then
+            result.Direction = "旧⊂新（追記）"
+            result.InclusionRate = CDbl(Len(normalized2)) / CDbl(Len(normalized1))
+        Else
+            result.Direction = "新⊂旧（削減）"
+            result.InclusionRate = CDbl(Len(normalized1)) / CDbl(Len(normalized2))
+        End If
+    End If
+    result.Details = "Levenshtein距離: " & result.EditDistance & " | 類似度: " & _
+        Format(similarity * 100, "0.0") & "%"
+    ExecuteCompleteStringAnalysisAdvanced = result
+End Function
+Function ExecuteCompleteStringAnalysisFastScore1Only(str1 As String, str2 As String) As AdvancedMatchResult
+    Dim result As AdvancedMatchResult
+    With result
+        .Score = 0
+        .matchType = "非類似"
+        .Direction = ""
+        .Details = ""
+        .EditDistance = 0
+        .InclusionRate = 0
+        .CommonWords = ""
+        .DifferencePoints = ""
+    End With
+    Dim normalized1 As String, normalized2 As String
+    normalized1 = NormalizeStringForMatchingFast(str1)
+    normalized2 = NormalizeStringForMatchingFast(str2)
+    If normalized1 = normalized2 Then
+        result.Score = 1
+        result.matchType = "完全一致"
+        result.Details = "完全一致"
+        ExecuteCompleteStringAnalysisFastScore1Only = result
+        Exit Function
+    End If
+    If normalized1 = "" And normalized2 = "" Then
+        result.Score = 1
+        result.matchType = "完全一致"
+        result.Details = "両方とも空白・空文字"
+        ExecuteCompleteStringAnalysisFastScore1Only = result
+        Exit Function
+    End If
+    ExecuteCompleteStringAnalysisFastScore1Only = result
+End Function
+' =============================================================================
+' 【段階的ペアリング v4.2】スコア1.0先行確定 + 重複使用防止 + 詳細マッチング
+' =============================================================================
+Sub ExecuteCompleteOptimalPairingFastV4_2(spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, ByRef pairings() As OptimalPairingInfo)
+    Application.StatusBar = "完全最適ペアリング計算開始..."
+    Dim score1Pairs() As Long
+    ReDim score1Pairs(1 To spec1.ActualRows)
+    Dim score1Count As Long
+    score1Count = 0
+    Dim used2() As Boolean
+    ReDim used2(1 To spec2.ActualRows)
+    Dim progressStep As Long
+    progressStep = WorksheetFunction.Max(STATUS_UPDATE_INTERVAL, spec1.ActualRows \ 4)
+    Dim i As Long, j As Long, data1 As String, data2 As String
+    Dim matchResult As AdvancedMatchResult
+    Application.StatusBar = "【第1段階】スコア1.0先行確定中..."
+    For i = 1 To spec1.ActualRows
+        If i Mod progressStep = 0 Then
+            Application.StatusBar = "スコア1.0判定中... (" & i & "/" & spec1.ActualRows & ")"
+            DoEvents
+        End If
+        On Error Resume Next
+        data1 = CStr(spec1.DataArray(i, 1))
+        On Error GoTo 0
+        For j = 1 To spec2.ActualRows
+            If Not used2(j) Then
+                On Error Resume Next
+                data2 = CStr(spec2.DataArray(j, 1))
+                On Error GoTo 0
+                matchResult = ExecuteCompleteStringAnalysisFastScore1Only(data1, data2)
+                If matchResult.Score = 1 Then
+                    score1Pairs(i) = j
+                    used2(j) = True
+                    score1Count = score1Count + 1
+                    Exit For
+                End If
+            End If
+        Next j
+    Next i
+    g_Score1Count = score1Count
+    Dim similarityMatrix() As Double
+    ReDim similarityMatrix(1 To spec1.ActualRows, 1 To spec2.ActualRows)
+    Application.StatusBar = "【第2段階】残り候補の詳細マッチング中..."
+    For i = 1 To spec1.ActualRows
+        If i Mod progressStep = 0 Then
+            Application.StatusBar = "詳細マッチング中... (" & i & "/" & spec1.ActualRows & ")"
+            DoEvents
+        End If
+        On Error Resume Next
+        data1 = CStr(spec1.DataArray(i, 1))
+        On Error GoTo 0
+        If score1Pairs(i) = 0 Then
+            For j = 1 To spec2.ActualRows
+                If Not used2(j) Then
+                    On Error Resume Next
+                    data2 = CStr(spec2.DataArray(j, 1))
+                    On Error GoTo 0
+                    matchResult = ExecuteCompleteStringAnalysisAdvanced(data1, data2)
+                    similarityMatrix(i, j) = matchResult.Score
+                Else
+                    similarityMatrix(i, j) = 0
+                End If
+            Next j
+        Else
+            similarityMatrix(i, score1Pairs(i)) = 1
+        End If
+    Next i
+    Dim assignments() As Long
+    Call ApplyCompleteHungarianAlgorithmV4_2(similarityMatrix, spec1.ActualRows, spec2.ActualRows, assignments, used2)
+    For i = 1 To spec1.ActualRows
+        If score1Pairs(i) > 0 Then
+            assignments(i) = score1Pairs(i)
+            g_OtherMatchCount = g_OtherMatchCount + 1
+        End If
+    Next i
+    Call BuildOptimalPairingResults(spec1, spec2, assignments, similarityMatrix, pairings)
+    g_ProcessingStats = "スコア1.0確定: " & g_Score1Count & "件, その他マッチ: " & (UBound(pairings) - g_Score1Count) & "件"
+    Application.StatusBar = "完全最適ペアリング完了"
+End Sub
+Sub ApplyCompleteHungarianAlgorithmV4_2(similarityMatrix() As Double, rows1 As Long, rows2 As Long, ByRef assignments() As Long, used2() As Boolean)
+    ReDim assignments(1 To rows1)
+    Dim pairList() As Variant, pairCount As Long, i As Long, j As Long
+    pairCount = 0
+    For i = 1 To rows1
+        For j = 1 To rows2
+            If Not used2(j) And similarityMatrix(i, j) >= MINIMUM_MATCH_THRESHOLD Then
+                pairCount = pairCount + 1
+            End If
+        Next j
+    Next i
+    ReDim pairList(1 To pairCount, 1 To 3)
+    Dim index As Long
+    index = 1
+    For i = 1 To rows1
+        For j = 1 To rows2
+            If Not used2(j) And similarityMatrix(i, j) >= MINIMUM_MATCH_THRESHOLD Then
+                pairList(index, 1) = i
+                pairList(index, 2) = j
+                pairList(index, 3) = similarityMatrix(i, j)
+                index = index + 1
+            End If
+        Next j
+    Next i
+    Dim k As Long, l As Long, temp1 As Variant, temp2 As Variant, temp3 As Variant
+    For k = 1 To pairCount - 1
+        For l = k + 1 To pairCount
+            If pairList(k, 3) < pairList(l, 3) Then
+                temp1 = pairList(k, 1)
+                temp2 = pairList(k, 2)
+                temp3 = pairList(k, 3)
+                pairList(k, 1) = pairList(l, 1)
+                pairList(k, 2) = pairList(l, 2)
+                pairList(k, 3) = pairList(l, 3)
+                pairList(l, 1) = temp1
+                pairList(l, 2) = temp2
+                pairList(l, 3) = temp3
+            End If
+        Next l
+    Next k
+    Dim usedSpec1() As Boolean
+    ReDim usedSpec1(1 To rows1)
+    Dim usedSpec2() As Boolean
+    ReDim usedSpec2(1 To rows2)
+    Dim m As Long
+    For m = 1 To rows2
+        If used2(m) Then
+            usedSpec2(m) = True
+        End If
+    Next m
+    For k = 1 To pairCount
+        i = pairList(k, 1)
+        j = pairList(k, 2)
+        If Not usedSpec1(i) And Not usedSpec2(j) Then
+            assignments(i) = j
+            usedSpec1(i) = True
+            usedSpec2(j) = True
+        End If
+    Next k
+End Sub
+Sub BuildOptimalPairingResults(spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, assignments() As Long, similarityMatrix() As Double, ByRef pairings() As OptimalPairingInfo)
+    Dim used2() As Boolean
+    ReDim used2(1 To spec2.ActualRows)
+    Dim i As Long
+    For i = 1 To spec1.ActualRows
+        If assignments(i) > 0 Then
+            used2(assignments(i)) = True
+        End If
+    Next i
+    Dim pairCount As Long
+    pairCount = spec1.ActualRows
+    For i = 1 To spec2.ActualRows
+        If Not used2(i) Then
+            pairCount = pairCount + 1
+        End If
+    Next i
+    ReDim pairings(1 To pairCount)
+    Dim pairIndex As Long
+    pairIndex = 1
+    For i = 1 To spec1.ActualRows
+        With pairings(pairIndex)
+            .spec1Row = i
+            .Spec2Row = assignments(i)
+            .IsPaired = (assignments(i) > 0)
+            .PairingRank = pairIndex
+            .DifferenceData = ""
+            If .IsPaired Then
+                Dim data1 As String, data2 As String
+                data1 = CStr(spec1.DataArray(i, 1))
+                data2 = CStr(spec2.DataArray(assignments(i), 1))
+                .matchResult = ExecuteCompleteStringAnalysisAdvanced(data1, data2)
+                Dim bestJ As Long, bestScore As Double
+                bestJ = 0
+                bestScore = WEAK_SIMILARITY_THRESHOLD
+                Dim j As Long
+                For j = 1 To spec2.ActualRows
+                    If j <> assignments(i) And similarityMatrix(i, j) > bestScore Then
+                        bestScore = similarityMatrix(i, j)
+                        bestJ = j
+                    End If
+                Next j
+                If bestJ > 0 Then
+                    .AlternativeCandidates = "行" & bestJ & "(" & Format(bestScore * 100, "0") & "%)"
+                Else
+                    .AlternativeCandidates = "なし"
+                End If
+            Else
+                .matchResult.Score = 0
+                .matchResult.matchType = "新規追加"
+                .matchResult.Details = "仕様書①新規追加項目"
+                .AlternativeCandidates = "なし"
+            End If
+        End With
+        pairIndex = pairIndex + 1
+    Next i
+    For i = 1 To spec2.ActualRows
+        If Not used2(i) Then
+            With pairings(pairIndex)
+                .spec1Row = 0
+                .Spec2Row = i
+                .IsPaired = False
+                .PairingRank = pairIndex
+                .matchResult.Score = 0
+                .matchResult.matchType = "廃止"
+                .matchResult.Details = "仕様書②廃止項目"
+                .AlternativeCandidates = "なし"
+                .DifferenceData = ""
+            End With
+            pairIndex = pairIndex + 1
+        End If
+    Next i
+End Sub
+' =============================================================================
+' 【LCS ベース差分チェック - WinMerge 方式】
+' =============================================================================
+Sub ExecuteDetailedDifferenceCheckFastLCS(spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, ByRef pairings() As OptimalPairingInfo)
+    Application.StatusBar = "LCS ベース差分チェック実行中..."
+    Dim i As Long, diffCount As Long, newCount As Long
+    Dim progressStep As Long
+    progressStep = WorksheetFunction.Max(STATUS_UPDATE_INTERVAL, UBound(pairings) \ 4)
+    
+    For i = 1 To UBound(pairings)
+        If i Mod progressStep = 0 Then
+            Application.StatusBar = "LCS 差分チェック中... (" & i & "/" & UBound(pairings) & ")"
+            DoEvents
+        End If
+        
+        If pairings(i).IsPaired And pairings(i).spec1Row > 0 And pairings(i).Spec2Row > 0 Then
+            Dim data1 As String, data2 As String
+            data1 = CStr(spec1.DataArray(pairings(i).spec1Row, 1))
+            data2 = CStr(spec2.DataArray(pairings(i).Spec2Row, 1))
+            
+            If data1 <> data2 Then
+                pairings(i).DifferenceDetailString = GenerateDifferenceDetailStringLCS(data1, data2)
+                pairings(i).DifferenceData = EncodeDifferenceDataLCS(data1, data2)
+                diffCount = diffCount + 1
+                
+                Dim severity As String
+                If pairings(i).matchResult.Score >= 0.8 Then
+                    severity = "低"
+                ElseIf pairings(i).matchResult.Score >= 0.6 Then
+                    severity = "中"
+                Else
+                    severity = "高"
+                End If
+                pairings(i).matchResult.Details = pairings(i).matchResult.Details & " | 重要度:" & severity
+            Else
+                pairings(i).DifferenceDetailString = "差分なし"
+                pairings(i).DifferenceData = ""
+            End If
+        ElseIf pairings(i).matchResult.matchType = "新規追加" Then
+            newCount = newCount + 1
+        End If
+    Next i
+    
+    Application.StatusBar = "LCS ベース差分チェック完了"
+End Sub
+Function GenerateDifferenceDetailStringLCS(str1 As String, str2 As String) As String
+    Dim lcs As String
+    lcs = CalculateLCS(str1, str2)
+    
+    If Len(str1) = Len(lcs) Then
+        GenerateDifferenceDetailStringLCS = "差分なし"
+        Exit Function
+    End If
+    
+    Dim added As String
+    added = ""
+    
+    Dim i As Long, j As Long, found As Boolean
+    For i = 1 To Len(str1)
+        Dim char As String
+        char = Mid(str1, i, 1)
+        found = False
+        For j = 1 To Len(lcs)
+            If char = Mid(lcs, j, 1) Then
+                found = True
+                Exit For
+            End If
+        Next j
+        If Not found Then
+            If Len(added) < 30 Then added = added & char
+        End If
+    Next i
+    
+    GenerateDifferenceDetailStringLCS = "追加: '" & added & "'"
+End Function
+Function EncodeDifferenceDataLCS(str1 As String, str2 As String) As String
+    Dim ranges() As DiffRange
+    Dim rangeCount As Long
+    rangeCount = CalculateDiffRangesLCS(str1, str2, ranges)
+    
+    Dim result As String
+    result = ""
+    Dim i As Long
+    
+    For i = 0 To rangeCount - 1
+        If result <> "" Then result = result & ";"
+        result = result & ranges(i).diffType & "|" & ranges(i).startPos & "|" & ranges(i).endPos
+    Next i
+    
+    EncodeDifferenceDataLCS = result
+End Function
+' =============================================================================
+' 【ファイル読み込み・シート選択関連】
+' =============================================================================
+Sub OptimizeExcelSettingsForPhase2SuperFast(restore As Boolean)
+    If restore Then
+        Application.ScreenUpdating = True
+        Application.DisplayAlerts = True
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+    Else
+        Application.ScreenUpdating = False
+        Application.DisplayAlerts = False
+        Application.Calculation = xlCalculationManual
+        Application.EnableEvents = False
+    End If
+End Sub
+Function SelectAndLoadSpecSheetAdvancedDebug(ByRef specInfo As SpecSheetInfo, titleText As String) As Boolean
+    SelectAndLoadSpecSheetAdvancedDebug = False
+    specInfo.FilePath = Application.GetOpenFilename("Excel Files (*.xls*),*.xls*", , titleText)
+    If specInfo.FilePath = "False" Then Exit Function
+    Application.ScreenUpdating = True
+    Set specInfo.Workbook = Workbooks.Open(specInfo.FilePath)
+    If specInfo.Workbook Is Nothing Then
+        MsgBox "ファイルを開くことができませんでした。", vbExclamation
+        Exit Function
+    End If
+    
+    Dim selectedSheetName As String
+    If specInfo.Workbook.Worksheets.count > 1 Then
+        selectedSheetName = ShowSheetSelectionDialog(specInfo.Workbook, titleText)
+        If selectedSheetName = "" Then
+            On Error Resume Next
+            If Workbooks.count > 1 Then
+                Workbooks(1).Activate
+            End If
+            If Not specInfo.Workbook Is Nothing Then
+                specInfo.Workbook.Close SaveChanges:=False
+            End If
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo SheetError
+        Set specInfo.Worksheet = specInfo.Workbook.Worksheets(selectedSheetName)
+        On Error GoTo 0
+    Else
+        Set specInfo.Worksheet = specInfo.Workbook.Worksheets(1)
+    End If
+    
+    specInfo.Workbook.Activate
+    specInfo.Worksheet.Activate
+    specInfo.Worksheet.Cells(1, 1).Select
+    Application.ScreenUpdating = True
+    DoEvents
+    Application.Wait Now + TimeValue("00:00:02")
+    MsgBox titleText & " のファイルが開かれました。次に列範囲を選択してください", vbInformation, "Phase2列選択案内"
+    Do
+        On Error GoTo SelectError
+        Set specInfo.TargetColumn = Application.InputBox("【" & titleText & "】チェック対象の列範囲を選択してください", "Phase2列選択", specInfo.Worksheet.Range("A:A").Address, Type:=8)
+        On Error GoTo 0
+        
+        If specInfo.TargetColumn Is Nothing Then
+            MsgBox "列選択がキャンセルされました。処理を中止します。", vbInformation, "キャンセル"
+            On Error Resume Next
+            If Workbooks.count > 1 Then
+                Workbooks(1).Activate
+            End If
+            If Not specInfo.Workbook Is Nothing Then
+                specInfo.Workbook.Close SaveChanges:=False
+            End If
+            On Error GoTo 0
+            Exit Function
+        End If
+        
+        Dim sampleCount As Long, i As Long, cellValue As String, previewText As String
+        sampleCount = WorksheetFunction.Min(10, specInfo.TargetColumn.Rows.count)
+        previewText = "=== Phase2列選択プレビュー ===" & vbCrLf
+        previewText = previewText & "選択範囲: " & specInfo.TargetColumn.Address & vbCrLf
+        previewText = previewText & "総行数: " & specInfo.TargetColumn.Rows.count & vbCrLf & vbCrLf
+        previewText = previewText & "--- データサンプル（最初の" & sampleCount & "行）---" & vbCrLf
+        For i = 1 To sampleCount
+            On Error Resume Next
+            cellValue = CStr(specInfo.TargetColumn.Cells(i, 1).Value)
+            On Error GoTo 0
+            If Len(cellValue) > 50 Then cellValue = Left(cellValue, 47) & "..."
+            previewText = previewText & Format(i, "00") & ": " & cellValue & vbCrLf
+        Next i
+        If specInfo.TargetColumn.Rows.count > sampleCount Then previewText = previewText & "..." & vbCrLf
+        previewText = previewText & vbCrLf & "この選択で続行しますか？"
+        If MsgBox(previewText, vbYesNo + vbQuestion, "確認") = vbYes Then Exit Do
+    Loop
+    If Not LoadDataToArrayHighSpeedDebug(specInfo) Then
+        MsgBox "データ読み込みに失敗しました", vbExclamation
+        On Error Resume Next
+        If Not specInfo.Workbook Is Nothing Then
+            specInfo.Workbook.Close SaveChanges:=False
+        End If
+        On Error GoTo 0
+        Exit Function
+    End If
+    SelectAndLoadSpecSheetAdvancedDebug = True
+    Exit Function
+SheetError:
+    MsgBox "指定されたシート名が見つかりません", vbExclamation
+    On Error Resume Next
+    If Not specInfo.Workbook Is Nothing Then
+        specInfo.Workbook.Close SaveChanges:=False
+    End If
+    On Error GoTo 0
+    Exit Function
+SelectError:
+    MsgBox "列選択がキャンセルされました。処理を中止します。", vbInformation, "キャンセル"
+    On Error Resume Next
+    If Not specInfo.Workbook Is Nothing Then
+        specInfo.Workbook.Close SaveChanges:=False
+    End If
+    On Error GoTo 0
+    Exit Function
+End Function
+' =============================================================================
+' 【新規関数】シート選択ダイアログ表示
+' =============================================================================
+Function ShowSheetSelectionDialog(wb As Workbook, titleText As String) As String
+    Dim sheetNames() As String
+    Dim sheetCount As Long
+    Dim i As Long
+    
+    sheetCount = wb.Worksheets.count
+    ReDim sheetNames(1 To sheetCount)
+    
+    For i = 1 To sheetCount
+        sheetNames(i) = wb.Worksheets(i).Name
+    Next i
+    
+    ShowSheetSelectionDialog = ShowSheetListDialog(sheetNames, titleText)
+End Function
+' =============================================================================
+' 【新規関数】シートリストボックスダイアログ生成
+' =============================================================================
+Function ShowSheetListDialog(sheetNames() As String, titleText As String) As String
+    Dim msg As String
+    Dim i As Long
+    Dim selectedIndex As Long
+    Dim response As String
+    
+    msg = "複数のシートが見つかりました。" & vbCrLf & vbCrLf
+    msg = msg & "【使用するシートを選択してください】" & vbCrLf & vbCrLf
+    
+    For i = 1 To UBound(sheetNames)
+        msg = msg & i & ": " & sheetNames(i) & vbCrLf
+    Next i
+    
+    msg = msg & vbCrLf & "例）1 と入力して『OK』を押してください"
+    
+    Do
+        response = InputBox(msg, "シート選択", "1")
+        
+        If response = "" Then
+            MsgBox "シート選択がキャンセルされました。処理を中止します。", vbInformation, "キャンセル"
+            ShowSheetListDialog = ""
+            Exit Function
+        End If
+        
+        If Not IsNumericValue(response) Then
+            MsgBox "数字を入力してください。", vbExclamation, "入力エラー"
+            GoTo RetryInput
+        End If
+        
+        selectedIndex = CLng(response)
+        
+        If selectedIndex < 1 Or selectedIndex > UBound(sheetNames) Then
+            MsgBox "範囲外です。1～" & UBound(sheetNames) & " の数字を入力してください。", vbExclamation, "入力エラー"
+            GoTo RetryInput
+        End If
+        
+        ShowSheetListDialog = sheetNames(selectedIndex)
+        Exit Function
+        
+RetryInput:
+    Loop
+End Function
+' =============================================================================
+' 【新規関数】数値判定ヘルパー
+' =============================================================================
+Function IsNumericValue(inputValue As String) As Boolean
+    On Error Resume Next
+    IsNumericValue = Not IsNull(CDbl(inputValue))
+    On Error GoTo 0
+End Function
+Function LoadDataToArrayHighSpeedDebug(ByRef specInfo As SpecSheetInfo) As Boolean
+    LoadDataToArrayHighSpeedDebug = False
+    Dim ws As Worksheet, targetCol As Long, lastRow As Long
+    Set ws = specInfo.Worksheet
+    targetCol = specInfo.TargetColumn.Column
+    On Error Resume Next
+    lastRow = ws.Cells(ws.Rows.count, targetCol).End(xlUp).row
+    If Err.Number <> 0 Then lastRow = 1
+    On Error GoTo 0
+    If lastRow < 1 Then lastRow = 1
+    If lastRow > MAX_ROWS Then
+        If MsgBox("データが" & lastRow & "行あります。" & MAX_ROWS & "行に制限しますか？", vbYesNo + vbQuestion) = vbYes Then
+            lastRow = MAX_ROWS
+        End If
+    End If
+    specInfo.ActualRows = lastRow
+    On Error GoTo ArrayError
+    Application.StatusBar = "Phase2 安全データ配列読み込み中... (" & lastRow & "行)"
+    If lastRow = 1 Then
+        ReDim specInfo.DataArray(1 To 1, 1 To 1)
+        specInfo.DataArray(1, 1) = CStr(ws.Cells(1, targetCol).Value)
+    Else
+        Dim sourceRange As Range
+        Set sourceRange = ws.Range(ws.Cells(1, targetCol), ws.Cells(lastRow, targetCol))
+        specInfo.DataArray = sourceRange.Value
+        If Not IsArray(specInfo.DataArray) Then
+            ReDim tempArray(1 To 1, 1 To 1) As Variant
+            tempArray(1, 1) = specInfo.DataArray
+            specInfo.DataArray = tempArray
+        End If
+    End If
+    LoadDataToArrayHighSpeedDebug = True
+    Exit Function
+ArrayError:
+    MsgBox "Phase2高速配列読み込みでエラー: " & Err.Description, vbExclamation
+    LoadDataToArrayHighSpeedDebug = False
+End Function
+Function NormalizeStringForMatchingFast(text As String) As String
+    Dim normalized As String
+    normalized = Trim(text)
+    normalized = Replace(normalized, vbCrLf, "")
+    normalized = Replace(normalized, vbCr, "")
+    normalized = Replace(normalized, vbLf, "")
+    normalized = Replace(normalized, "　", " ")
+    Do While InStr(normalized, "  ") > 0
+        normalized = Replace(normalized, "  ", " ")
+    Loop
+    NormalizeStringForMatchingFast = Trim(normalized)
+End Function
+' =============================================================================
+' 【Excel 出力・赤文字ハイライト】
+' =============================================================================
+Function CreateCompleteResultOutputWithHighlightFast(spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, pairings() As OptimalPairingInfo) As Workbook
+    Set CreateCompleteResultOutputWithHighlightFast = Workbooks.Add
+    Call CreateMainResultSheetWithHighlightFast(CreateCompleteResultOutputWithHighlightFast, spec1, spec2, pairings)
+End Function
+Sub CreateMainResultSheetWithHighlightFast(wb As Workbook, spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, pairings() As OptimalPairingInfo)
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets(1)
+    ws.Name = "マッチング結果"
+    ws.Select
+    Dim headers As Variant
+    headers = Array("ペア番号", "マッチタイプ", "①行番号", "①新_仕様書データ", "②行番号", "②旧_仕様書データ")
+    Dim totalPairs As Long
+    totalPairs = UBound(pairings)
+    Dim resultArray() As Variant
+    ReDim resultArray(1 To totalPairs + 1, 1 To 6)
+    Dim col As Long
+    For col = 1 To 6
+        resultArray(1, col) = headers(col - 1)
+    Next col
+    Application.StatusBar = "メイン結果シート構築中..."
+    Dim row As Long, progressStep As Long
+    progressStep = WorksheetFunction.Max(STATUS_UPDATE_INTERVAL, totalPairs \ 4)
+    For row = 1 To totalPairs
+        Dim wsRow As Long
+        wsRow = row + 1
+        If row Mod progressStep = 0 Then
+            Application.StatusBar = "メイン結果構築中... (" & row & "/" & totalPairs & ")"
+            DoEvents
+        End If
+        With pairings(row)
+            resultArray(wsRow, 1) = row
+            resultArray(wsRow, 2) = .matchResult.matchType
+            resultArray(wsRow, 3) = IIf(.spec1Row = 0, "欠損", .spec1Row)
+            resultArray(wsRow, 5) = IIf(.Spec2Row = 0, "欠損", .Spec2Row)
+            Dim data1 As String, data2 As String
+            data1 = ""
+            data2 = ""
+            On Error Resume Next
+            If .spec1Row > 0 And .spec1Row <= spec1.ActualRows Then
+                data1 = CStr(spec1.DataArray(.spec1Row, 1))
+            End If
+            If .Spec2Row > 0 And .Spec2Row <= spec2.ActualRows Then
+                data2 = CStr(spec2.DataArray(.Spec2Row, 1))
+            End If
+            On Error GoTo 0
+            resultArray(wsRow, 4) = data1
+            resultArray(wsRow, 6) = data2
+        End With
+    Next row
+    Application.StatusBar = "一括書き込み中..."
+    ws.Range("A1").Resize(totalPairs + 1, 6).Value = resultArray
+    On Error Resume Next
+    With ws
+        With .Range("A1:F1")
+            .Font.Bold = True
+            .Interior.Color = RGB(128, 128, 128)
+            .Font.Color = RGB(255, 255, 255)
+            .HorizontalAlignment = xlCenter
+            .WrapText = True
+            .Borders.Weight = xlThin
+        End With
+        .Range("A2:F" & (totalPairs + 1)).Font.Name = "BIZ UDPゴシック"
+        .Range("B2:B" & (totalPairs + 1)).Font.Bold = True
+        Dim dataRange As Range
+        Set dataRange = .Range("B2:B" & (totalPairs + 1))
+        dataRange.FormatConditions.Delete
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "完全一致")
+            .Interior.Color = RGB(95, 107, 244)
+            .Font.Color = RGB(255, 255, 255)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "包含一致")
+            .Interior.Color = RGB(255, 0, 0)
+            .Font.Color = RGB(255, 255, 255)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "高類似一致")
+            .Interior.Color = RGB(240, 120, 186)
+            .Font.Color = RGB(0, 0, 0)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "中類似一致")
+            .Interior.Color = RGB(255, 200, 124)
+            .Font.Color = RGB(0, 0, 0)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "弱類似一致")
+            .Interior.Color = RGB(255, 230, 180)
+            .Font.Color = RGB(0, 0, 0)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "新規追加")
+            .Interior.Color = RGB(20, 205, 180)
+            .Font.Color = RGB(0, 0, 0)
+            .Font.Bold = True
+        End With
+        With dataRange.FormatConditions.Add(xlCellValue, xlEqual, "廃止")
+            .Interior.Color = RGB(167, 175, 193)
+            .Font.Color = RGB(0, 0, 0)
+            .Font.Bold = True
+        End With
+        .Range("A1:F" & (totalPairs + 1)).Borders.Weight = xlThin
+        .Columns("A").ColumnWidth = 6
+        .Columns("B").ColumnWidth = 12
+        .Columns("C").ColumnWidth = 6
+        .Columns("D").ColumnWidth = 100
+        .Columns("E").ColumnWidth = 6
+        .Columns("F").ColumnWidth = 100
+        .Range("A1:F" & (totalPairs + 1)).WrapText = True
+        .Range("A1:F" & (totalPairs + 1)).AutoFilter
+        .Range("A2").Select
+        ActiveWindow.FreezePanes = True
+    End With
+    On Error GoTo 0
+    
+    Call HighlightWarningCellsInStep1(ws, totalPairs)
+End Sub
+Function ShowRedTextHighlightDecisionDialog() As Boolean
+    Dim response As VbMsgBoxResult
+    response = MsgBox("赤文字インライン処理を実行しますか？" & vbCrLf & vbCrLf & _
+        "【はい】LCS ベース赤文字インラインを適用（処理時間: 1～3分）" & vbCrLf & _
+        "【いいえ】このまま終了（現在の表示を保持）", _
+        vbYesNo + vbQuestion, "赤文字インライン処理選択")
+    ShowRedTextHighlightDecisionDialog = (response = vbYes)
+End Function
+Sub ApplyRedTextHighlightToResultWorkbookLCS(wb As Workbook, spec1 As SpecSheetInfo, spec2 As SpecSheetInfo, pairings() As OptimalPairingInfo)
+    Application.StatusBar = "LCS ベース赤文字インライン処理開始..."
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets("マッチング結果")
+    Dim totalPairs As Long
+    totalPairs = UBound(pairings)
+    Dim i As Long, progressStep As Long
+    progressStep = WorksheetFunction.Max(STATUS_UPDATE_INTERVAL, totalPairs \ 4)
+    
+    For i = 1 To totalPairs
+        If i Mod progressStep = 0 Then
+            Application.StatusBar = "LCS ハイライト適用中... (" & i & "/" & totalPairs & ")"
+            DoEvents
+        End If
+        
+        Dim wsRow As Long
+        wsRow = i + 1
+        
+        With pairings(i)
+            If .matchResult.matchType = "新規追加" Then
+                Dim dataLen As Long
+                On Error Resume Next
+                Dim cellValue As String
+                cellValue = CStr(ws.Cells(wsRow, 4).Value)
+                On Error GoTo 0
+                dataLen = Len(cellValue)
+                If dataLen > 0 Then
+                    On Error Resume Next
+                    ws.Cells(wsRow, 4).Characters(1, dataLen).Font.Color = RGB(255, 0, 0)
+                    ws.Cells(wsRow, 4).Characters(1, dataLen).Font.Bold = True
+                    On Error GoTo 0
+                End If
+            ElseIf .DifferenceData <> "" Then
+                Call ApplyLCSDiffHighlight(ws.Cells(wsRow, 4), .DifferenceData)
+            End If
+        End With
+    Next i
+    
+    Application.StatusBar = "LCS ベース赤文字インライン処理完了"
+End Sub
+Sub ApplyLCSDiffHighlight(targetCell As Range, diffData As String)
+    On Error Resume Next
+    
+    If diffData = "" Then
+        On Error GoTo 0
+        Exit Sub
+    End If
+    
+    Dim cellText As String
+    cellText = CStr(targetCell.Value)
+    On Error GoTo 0
+    
+    If Len(cellText) = 0 Then Exit Sub
+    
+    On Error Resume Next
+    targetCell.Characters.Font.Color = RGB(0, 0, 0)
+    targetCell.Characters.Font.Bold = False
+    On Error GoTo 0
+    
+    Dim parts() As String
+    parts = Split(diffData, ";")
+    Dim i As Long
+    
+    For i = 0 To UBound(parts)
+        If parts(i) <> "" Then
+            Dim info() As String
+            info = Split(parts(i), "|")
+            
+            If UBound(info) >= 2 Then
+                Dim diffType As String, startPos As Long, endPos As Long
+                diffType = info(0)
+                On Error Resume Next
+                startPos = CLng(info(1))
+                endPos = CLng(info(2))
+                On Error GoTo 0
+                
+                If diffType = "ADDED" And startPos >= 1 And endPos >= startPos Then
+                    Dim length As Long
+                    length = endPos - startPos + 1
+                    
+                    If length > 0 And (startPos + length - 1) <= Len(cellText) Then
+                        On Error Resume Next
+                        targetCell.Characters(startPos, length).Font.Color = RGB(255, 0, 0)
+                        targetCell.Characters(startPos, length).Font.Bold = True
+                        On Error GoTo 0
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    
+    On Error GoTo 0
+End Sub
+' =============================================================================
+' 【Step1段階の警告ハイライト】
+' =============================================================================
+Sub HighlightWarningCellsInStep1(ws As Worksheet, totalPairs As Long)
+    Application.StatusBar = "Step1段階：警告ハイライト適用中..."
+    
+    Dim row As Long
+    For row = 2 To totalPairs + 1
+        On Error Resume Next
+        Dim matchType As String
+        matchType = CStr(ws.Cells(row, 2).Value)
+        On Error GoTo 0
+        
+        If matchType <> "完全一致" And matchType <> "廃止" And matchType <> "" Then
+            On Error Resume Next
+            ws.Cells(row, 3).Interior.Color = RGB(246, 253, 203)
+            ws.Cells(row, 4).Interior.Color = RGB(246, 253, 203)
+            On Error GoTo 0
+        End If
+    Next row
+    
+    Application.StatusBar = "Step1段階：警告ハイライト完了"
+End Sub
+Sub SaveAsSpec3ToDownloadsPhase2(wb As Workbook)
+    Dim downloadsFolder As String, fileName As String, fullPath As String
+    On Error Resume Next
+    downloadsFolder = CreateObject("WScript.Shell").SpecialFolders("Downloads")
+    If Err.Number <> 0 Or downloadsFolder = "" Then
+        downloadsFolder = Environ("USERPROFILE") & "\Downloads"
+        If Dir(downloadsFolder, vbDirectory) = "" Then
+            downloadsFolder = Environ("USERPROFILE") & "\Desktop"
+            If Dir(downloadsFolder, vbDirectory) = "" Then
+                downloadsFolder = ThisWorkbook.Path
+            End If
+        End If
+    End If
+    On Error GoTo 0
+    fileName = "③仕様差分チェック後_" & Format(Now, "yyyymmdd_hhnnss") & ".xlsx"
+    fullPath = downloadsFolder & "\" & fileName
+    If Dir(fullPath) <> "" Then
+        Dim counter As Integer
+        counter = 1
+        Dim basePath As String
+        basePath = Left(fullPath, Len(fullPath) - 5)
+        Do While Dir(fullPath) <> ""
+            fullPath = basePath & "_(" & counter & ").xlsx"
+            counter = counter + 1
+            If counter > 100 Then Exit Do
+        Loop
+    End If
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    wb.SaveAs fileName:=fullPath, FileFormat:=xlOpenXMLWorkbook
+    If Err.Number = 0 Then
+        g_SavedFilePath = fullPath
+    Else
+        MsgBox "ファイル保存に失敗しました: " & Err.Description, vbExclamation, "保存エラー"
+        g_SavedFilePath = ""
+    End If
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+End Sub
+Sub AutoLaunchResultFilePhase2()
+    If g_SavedFilePath <> "" And Dir(g_SavedFilePath) <> "" Then
+        Application.StatusBar = "Phase 2結果ファイル起動中..."
+        DoEvents
+        Application.Wait Now + TimeValue("00:00:01")
+        On Error Resume Next
+        Workbooks.Open g_SavedFilePath
+        If Err.Number <> 0 Then
+            Err.Clear
+            Shell "rundll32.exe url.dll,FileProtocolHandler """ & g_SavedFilePath & """", vbNormalFocus
+        End If
+        On Error GoTo 0
+        Application.StatusBar = False
+    End If
+End Sub
+

@@ -1,0 +1,39 @@
+# Excel テンポラリファイル
+~$*.xlsx
+~$*.xls
+*.xlk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 一時ファイル
+*.tmp
+*.bak
+*.log
+
+# Node.js（将来用）
+node_modules/
+npm-debug.log
+
+# Python（将来用）
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ユーザーの出力ファイル（ローカル検証用）
+test_output/
+debug_logs/
+
+# 除外設定（これらは含める）
+!templates/
+!vba/
+!docs/
+!README.md
